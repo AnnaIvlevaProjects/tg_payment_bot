@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -214,15 +215,20 @@ async def save_email(message: Message, state: FSMContext, db: Database, messages
     await message.answer(messages.email_saved, reply_markup=main_menu())
 
 
-def month_shift(start: date, months_ahead: int) -> tuple[int, int]:
-    month0 = (start.month - 1) + months_ahead
-    return start.year + month0 // 12, month0 % 12 + 1
+def add_months(base: date, months_ahead: int) -> date:
+    month0 = (base.month - 1) + months_ahead
+    year = base.year + month0 // 12
+    month = month0 % 12 + 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
 
 
 def active_payment_month_index(today: date, course_start_date: date) -> int | None:
     for month_index in range(1, 6):
-        year, month = month_shift(course_start_date, month_index)
-        if today.year == year and today.month == month:
+        period_end = add_months(course_start_date, month_index)
+        period_start_raw = add_months(course_start_date, month_index - 1)
+        period_start = period_start_raw if month_index == 1 else period_start_raw + timedelta(days=1)
+        if period_start <= today <= period_end:
             return month_index
     return None
 
