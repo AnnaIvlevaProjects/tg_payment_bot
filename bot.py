@@ -5,6 +5,7 @@ import calendar
 import json
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -42,6 +43,9 @@ class Settings:
     check_interval_hours: int
     course_start_date: date
     messages_file: str
+    log_file: str
+    log_max_bytes: int
+    log_backup_count: int
 
 
 @dataclass(slots=True)
@@ -74,12 +78,43 @@ def load_settings() -> Settings:
         check_interval_hours=int(os.getenv("CHECK_INTERVAL_HOURS", "24")),
         course_start_date=date.fromisoformat(os.getenv("COURSE_START_DATE", "2026-04-04")),
         messages_file=os.getenv("MESSAGES_FILE", "messages.json"),
+        log_file=os.getenv("LOG_FILE", "bot.log"),
+        log_max_bytes=int(os.getenv("LOG_MAX_BYTES", "1048576")),
+        log_backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5")),
     )
 
 
 def load_messages(path: str) -> Messages:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return Messages(**raw)
+
+
+def setup_logging(settings: Settings) -> None:
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        settings.log_file,
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler], force=True)
+
+
+async def ensure_user_exists(message: Message, db: Database, settings: Settings) -> None:
+    await db.upsert_user(
+        user_id=message.from_user.id,
+        user_name=message.from_user.username,
+        user_fn=message.from_user.first_name,
+        user_ln=message.from_user.last_name,
+        source=None,
+        course_start_date=settings.course_start_date.isoformat(),
+    )
 
 
 router = Router()
@@ -100,24 +135,28 @@ async def start(message: Message, command: CommandObject, db: Database, settings
 
 
 @router.message(F.text == "⬅️ Главное меню")
-async def to_main_menu(message: Message, state: FSMContext) -> None:
+async def to_main_menu(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+    await ensure_user_exists(message, db, settings)
     await state.clear()
     await message.answer("Вы в главном меню.", reply_markup=main_menu())
 
 
 @router.message(F.text == "О курсе")
-async def about_course(message: Message, messages: Messages) -> None:
+async def about_course(message: Message, messages: Messages, db: Database, settings: Settings) -> None:
+    await ensure_user_exists(message, db, settings)
     await message.answer(messages.about_course)
 
 
 @router.message(F.text == "Оплатить")
-async def pay_menu(message: Message, messages: Messages) -> None:
+async def pay_menu(message: Message, messages: Messages, db: Database, settings: Settings) -> None:
+    await ensure_user_exists(message, db, settings)
     await message.answer(messages.payment_details, reply_markup=back_to_main_menu())
     await message.answer(messages.choose_payment_target, reply_markup=month_selector())
 
 
 @router.callback_query(F.data.startswith("month:"))
-async def pick_month(callback: CallbackQuery, state: FSMContext, db: Database, messages: Messages) -> None:
+async def pick_month(callback: CallbackQuery, state: FSMContext, db: Database, settings: Settings, messages: Messages) -> None:
+    await ensure_user_exists(callback.message, db, settings)
     target = callback.data.split(":", maxsplit=1)[1]
 
     if target == "full":
@@ -146,6 +185,7 @@ async def upload_receipt(
     settings: Settings,
     messages: Messages,
 ) -> None:
+    await ensure_user_exists(message, db, settings)
     data = await state.get_data()
     target: PaymentTarget | None = data.get("target")
     if not target:
@@ -199,13 +239,15 @@ async def premature_receipt_upload(message: Message, messages: Messages) -> None
 
 
 @router.message(PayFlow.waiting_for_email, F.text == "Пропустить")
-async def skip_email(message: Message, state: FSMContext, messages: Messages) -> None:
+async def skip_email(message: Message, state: FSMContext, messages: Messages, db: Database, settings: Settings) -> None:
+    await ensure_user_exists(message, db, settings)
     await state.clear()
     await message.answer(messages.email_skipped, reply_markup=main_menu())
 
 
 @router.message(PayFlow.waiting_for_email, F.text)
-async def save_email(message: Message, state: FSMContext, db: Database, messages: Messages) -> None:
+async def save_email(message: Message, state: FSMContext, db: Database, messages: Messages, settings: Settings) -> None:
+    await ensure_user_exists(message, db, settings)
     email = message.text.strip()
     if not EMAIL_RE.match(email):
         await message.answer(messages.email_invalid)
@@ -299,8 +341,8 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     settings = load_settings()
+    setup_logging(settings)
     messages = load_messages(settings.messages_file)
     db = Database(settings.db_path)
     await db.init()
