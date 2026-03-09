@@ -230,10 +230,19 @@ def payment_period_bounds(course_start_date: date, month_index: int) -> tuple[da
 
 
 def active_payment_month_index(today: date, course_start_date: date) -> int | None:
-    for month_index in range(1, 6):
+    for month_index in range(1, 7):
         period_start, period_end = payment_period_bounds(course_start_date, month_index)
         if period_start <= today <= period_end:
             return month_index
+    return None
+
+
+def current_due_payment_event(today: date, course_start_date: date) -> tuple[int, date, date] | None:
+    for payment_index in range(2, 7):
+        removal_date = add_months(course_start_date, payment_index - 1)
+        reminder_date = removal_date - timedelta(days=3)
+        if today == reminder_date or today == removal_date:
+            return payment_index, reminder_date, removal_date
     return None
 
 
@@ -241,46 +250,45 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
     while True:
         users = await db.iter_users()
         today = date.today()
-        active_month = active_payment_month_index(today, settings.course_start_date)
+        due_event = current_due_payment_event(today, settings.course_start_date)
 
-        if active_month is not None:
-            for user in users:
-                payment_value = user.payments[f"payment_{active_month}"]
+        for user in users:
+            if due_event is not None:
+                payment_index, reminder_date, removal_date = due_event
+                payment_value = user.payments[f"payment_{payment_index}"]
                 paid_for_period = payment_value == "да"
 
-                period_start, _ = payment_period_bounds(settings.course_start_date, active_month)
-                removal_date = period_start
-                reminder_date = removal_date - timedelta(days=3)
-
-                if today == reminder_date and not paid_for_period and user.last_reminder_month != active_month:
+                if today == reminder_date and not paid_for_period and user.last_reminder_month != payment_index:
                     try:
                         await bot.send_message(
                             user.user_id,
                             messages.reminder_template.format(
-                                month=active_month,
+                                month=payment_index,
                                 removal_date=removal_date.strftime("%d.%m.%Y"),
                             ),
                         )
-                        await db.set_last_reminder_month(user.user_id, active_month)
+                        await db.set_last_reminder_month(user.user_id, payment_index)
                     except Exception as exc:  # noqa: BLE001
                         logging.warning("Could not send reminder to %s: %s", user.user_id, exc)
 
-                if today == removal_date and not paid_for_period and user.last_removal_month != active_month:
+                if today == removal_date and not paid_for_period and user.last_removal_month != payment_index:
                     try:
                         await bot.ban_chat_member(settings.course_chat_id, user.user_id)
                         await db.set_removed_flag(user.user_id, True)
-                        await db.set_last_removal_month(user.user_id, active_month)
+                        await db.set_last_removal_month(user.user_id, payment_index)
                         await bot.send_message(
                             user.user_id,
                             messages.removed_template.format(
-                                month=active_month,
+                                month=payment_index,
                                 removal_date=removal_date.strftime("%d.%m.%Y"),
                             ),
                         )
                     except Exception as exc:  # noqa: BLE001
                         logging.warning("Could not remove user %s: %s", user.user_id, exc)
 
-                if paid_for_period and user.removed_from_chat:
+            if user.removed_from_chat and user.last_removal_month:
+                debt_paid = user.payments.get(f"payment_{user.last_removal_month}") == "да"
+                if debt_paid:
                     try:
                         await bot.unban_chat_member(settings.course_chat_id, user.user_id, only_if_banned=True)
                         await db.set_removed_flag(user.user_id, False)
