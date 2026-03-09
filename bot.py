@@ -8,7 +8,7 @@ import os
 from logging.handlers import RotatingFileHandler
 import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -46,6 +46,7 @@ class Settings:
     log_file: str
     log_max_bytes: int
     log_backup_count: int
+    report_hour_utc: int
 
 
 @dataclass(slots=True)
@@ -81,6 +82,7 @@ def load_settings() -> Settings:
         log_file=os.getenv("LOG_FILE", "bot.log"),
         log_max_bytes=int(os.getenv("LOG_MAX_BYTES", "1048576")),
         log_backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5")),
+        report_hour_utc=int(os.getenv("REPORT_HOUR_UTC", "8")),
     )
 
 
@@ -131,6 +133,7 @@ async def start(message: Message, command: CommandObject, db: Database, settings
         source=source,
         course_start_date=settings.course_start_date.isoformat(),
     )
+    await db.log_start_event(message.from_user.id, source)
     await message.answer(messages.welcome, reply_markup=main_menu())
 
 
@@ -216,8 +219,10 @@ async def upload_receipt(
 
     if target == "full":
         await db.mark_full_payment(message.from_user.id)
+        await db.log_payment_event(message.from_user.id, "full")
     else:
         await db.mark_payment(message.from_user.id, target)
+        await db.log_payment_event(message.from_user.id, str(target))
 
     try:
         await bot.unban_chat_member(settings.course_chat_id, message.from_user.id, only_if_banned=True)
@@ -340,6 +345,30 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
         await asyncio.sleep(settings.check_interval_hours * 3600)
 
 
+async def daily_admin_report_worker(bot: Bot, db: Database, settings: Settings) -> None:
+    while True:
+        now_utc = datetime.utcnow()
+        yesterday = now_utc.date() - timedelta(days=1)
+
+        if now_utc.hour >= settings.report_hour_utc and not await db.was_daily_report_sent(yesterday):
+            starts_count, payments_count, source_stats = await db.get_daily_stats(yesterday)
+            source_lines = "\n".join(f"- {source}: {count}" for source, count in source_stats) or "- нет переходов"
+            report_text = (
+                f"📊 Суточный отчёт за {yesterday.strftime('%d.%m.%Y')}\n"
+                f"Переходов на бота: {starts_count}\n"
+                f"Оплат: {payments_count}\n"
+                f"По меткам source:\n{source_lines}"
+            )
+            try:
+                await bot.send_message(settings.admin_chat_id, report_text)
+                await db.mark_daily_report_sent(yesterday)
+                logging.info("event=daily_report_sent date=%s starts=%s payments=%s", yesterday, starts_count, payments_count)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("event=daily_report_failed date=%s error=%s", yesterday, exc)
+
+        await asyncio.sleep(3600)
+
+
 async def main() -> None:
     settings = load_settings()
     setup_logging(settings)
@@ -356,10 +385,12 @@ async def main() -> None:
     dp.include_router(router)
 
     guard_task = asyncio.create_task(payment_guard_worker(bot, db, settings, messages))
+    report_task = asyncio.create_task(daily_admin_report_worker(bot, db, settings))
     try:
         await dp.start_polling(bot)
     finally:
         guard_task.cancel()
+        report_task.cancel()
 
 
 if __name__ == "__main__":

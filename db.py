@@ -58,6 +58,35 @@ class Database:
             )
             await self._ensure_column(conn, "last_reminder_month", "INTEGER")
             await self._ensure_column(conn, "last_removal_month", "INTEGER")
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS start_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    source TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    payment_target TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    report_date TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             await conn.commit()
 
     async def _ensure_column(self, conn: aiosqlite.Connection, column_name: str, definition: str) -> None:
@@ -91,6 +120,22 @@ class Database:
                     updated_at = excluded.updated_at
                 """,
                 (user_id, user_name, user_fn, user_ln, source, course_start_date, now, now),
+            )
+            await conn.commit()
+
+    async def log_start_event(self, user_id: int, source: Optional[str]) -> None:
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                "INSERT INTO start_events (user_id, source, created_at) VALUES (?, ?, ?)",
+                (user_id, source, datetime.utcnow().isoformat()),
+            )
+            await conn.commit()
+
+    async def log_payment_event(self, user_id: int, payment_target: str) -> None:
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                "INSERT INTO payment_events (user_id, payment_target, created_at) VALUES (?, ?, ?)",
+                (user_id, payment_target, datetime.utcnow().isoformat()),
             )
             await conn.commit()
 
@@ -215,3 +260,49 @@ class Database:
                 (month_index, datetime.utcnow().isoformat(), user_id),
             )
             await conn.commit()
+
+    async def was_daily_report_sent(self, report_date: date) -> bool:
+        async with aiosqlite.connect(self.db_path) as conn:
+            cursor = await conn.execute(
+                "SELECT 1 FROM daily_reports WHERE report_date = ?",
+                (report_date.isoformat(),),
+            )
+            return await cursor.fetchone() is not None
+
+    async def mark_daily_report_sent(self, report_date: date) -> None:
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                "INSERT OR IGNORE INTO daily_reports (report_date, created_at) VALUES (?, ?)",
+                (report_date.isoformat(), datetime.utcnow().isoformat()),
+            )
+            await conn.commit()
+
+    async def get_daily_stats(self, day: date) -> tuple[int, int, list[tuple[str, int]]]:
+        start = datetime(day.year, day.month, day.day).isoformat()
+        end = datetime(day.year, day.month, day.day, 23, 59, 59).isoformat()
+        async with aiosqlite.connect(self.db_path) as conn:
+            starts_cursor = await conn.execute(
+                "SELECT COUNT(*) FROM start_events WHERE created_at BETWEEN ? AND ?",
+                (start, end),
+            )
+            starts_count = (await starts_cursor.fetchone())[0]
+
+            payments_cursor = await conn.execute(
+                "SELECT COUNT(*) FROM payment_events WHERE created_at BETWEEN ? AND ?",
+                (start, end),
+            )
+            payments_count = (await payments_cursor.fetchone())[0]
+
+            sources_cursor = await conn.execute(
+                """
+                SELECT COALESCE(NULLIF(source, ''), 'без_метки') as src, COUNT(*)
+                FROM start_events
+                WHERE created_at BETWEEN ? AND ?
+                GROUP BY src
+                ORDER BY COUNT(*) DESC
+                """,
+                (start, end),
+            )
+            source_stats = await sources_cursor.fetchall()
+
+        return starts_count, payments_count, [(row[0], row[1]) for row in source_stats]
