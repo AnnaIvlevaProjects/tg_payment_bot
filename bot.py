@@ -224,9 +224,8 @@ def add_months(base: date, months_ahead: int) -> date:
 
 
 def payment_period_bounds(course_start_date: date, month_index: int) -> tuple[date, date]:
-    period_end = add_months(course_start_date, month_index)
-    period_start_raw = add_months(course_start_date, month_index - 1)
-    period_start = period_start_raw if month_index == 1 else period_start_raw + timedelta(days=1)
+    period_start = add_months(course_start_date, month_index - 1)
+    period_end = add_months(course_start_date, month_index) - timedelta(days=1)
     return period_start, period_end
 
 
@@ -249,8 +248,9 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
                 payment_value = user.payments[f"payment_{active_month}"]
                 paid_for_period = payment_value == "да"
 
-                _, period_end = payment_period_bounds(settings.course_start_date, active_month)
-                reminder_date = period_end - timedelta(days=3)
+                period_start, _ = payment_period_bounds(settings.course_start_date, active_month)
+                removal_date = period_start
+                reminder_date = removal_date - timedelta(days=3)
 
                 if today == reminder_date and not paid_for_period and user.last_reminder_month != active_month:
                     try:
@@ -258,14 +258,14 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
                             user.user_id,
                             messages.reminder_template.format(
                                 month=active_month,
-                                removal_date=period_end.strftime("%d.%m.%Y"),
+                                removal_date=removal_date.strftime("%d.%m.%Y"),
                             ),
                         )
                         await db.set_last_reminder_month(user.user_id, active_month)
                     except Exception as exc:  # noqa: BLE001
                         logging.warning("Could not send reminder to %s: %s", user.user_id, exc)
 
-                if today == period_end and not paid_for_period and user.last_removal_month != active_month:
+                if today == removal_date and not paid_for_period and user.last_removal_month != active_month:
                     try:
                         await bot.ban_chat_member(settings.course_chat_id, user.user_id)
                         await db.set_removed_flag(user.user_id, True)
@@ -274,7 +274,7 @@ async def payment_guard_worker(bot: Bot, db: Database, settings: Settings, messa
                             user.user_id,
                             messages.removed_template.format(
                                 month=active_month,
-                                removal_date=period_end.strftime("%d.%m.%Y"),
+                                removal_date=removal_date.strftime("%d.%m.%Y"),
                             ),
                         )
                     except Exception as exc:  # noqa: BLE001
